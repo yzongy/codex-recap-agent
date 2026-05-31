@@ -19,8 +19,28 @@ def render_markdown(report: DailyReport) -> str:
         f"- 输入 tokens: {report.metrics.get('tokens_input', 0)}",
         f"- 输出 tokens: {report.metrics.get('tokens_output', 0)}",
         "",
-        "## 今日摘要",
+        "## 今日评分",
     ]
+    if report.score:
+        lines.extend(
+            [
+                f"- 总分: {report.score.total} / 100（{report.score.label}）",
+                f"- 趋势: {report.score.trend_label}",
+                f"- 正反馈: {report.score.positive_feedback}",
+                f"- 负反馈: {report.score.negative_feedback}",
+            ]
+        )
+        if report.score.dimensions:
+            for dim in report.score.dimensions:
+                lines.append(f"- {dim.label}: {dim.score} / 25 - {dim.detail}")
+    else:
+        lines.append("- 今天没有评分数据。")
+    lines.extend(
+        [
+            "",
+            "## 今日摘要",
+        ]
+    )
     if report.sessions:
         for session in report.sessions[:8]:
             label = session.thread_name or session.session_id

@@ -132,7 +132,7 @@ def generate_report(app, conn, target_date: str):
     shell_snapshot_counts = count_shell_snapshots(app.shell_snapshots_dir)
     enrich_summaries(selected, history_tails, shell_snapshot_counts)
     daily = filter_sessions_for_day(selected, target_date)
-    report = build_daily_report(target_date, daily)
+    report = build_daily_report(target_date, daily, history_sessions=selected)
     report.metrics["git"] = collect_git_summaries([session.cwd for session in daily])
     report.path = str(app.reports_dir / f"{target_date}.md")
     return report
