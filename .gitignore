@@ -1,0 +1,14 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local Codex recap state
+data/
+reports/
+
+# Local Codex workspace extras
+skills/
