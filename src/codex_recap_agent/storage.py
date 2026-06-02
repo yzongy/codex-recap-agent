@@ -187,3 +187,37 @@ def fetch_sessions(conn: sqlite3.Connection, since: str | None = None) -> List[s
             "SELECT * FROM sessions ORDER BY COALESCE(updated_at, started_at) DESC, session_id DESC"
         )
     return list(cur.fetchall())
+
+
+def fetch_events_for_sessions(conn: sqlite3.Connection, session_ids: Iterable[str]) -> List[EventRecord]:
+    ids = [session_id for session_id in dict.fromkeys(session_ids) if session_id]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT session_id, turn_id, event_type, timestamp, raw_type, message, data_json
+        FROM events
+        WHERE session_id IN ({placeholders})
+        ORDER BY timestamp ASC, id ASC
+        """,
+        ids,
+    ).fetchall()
+    events: List[EventRecord] = []
+    for row in rows:
+        try:
+            data = json.loads(row["data_json"]) if row["data_json"] else {}
+        except json.JSONDecodeError:
+            data = {}
+        events.append(
+            EventRecord(
+                session_id=row["session_id"],
+                turn_id=row["turn_id"],
+                event_type=row["event_type"],
+                timestamp=row["timestamp"],
+                raw_type=row["raw_type"],
+                message=row["message"],
+                data=data,
+            )
+        )
+    return events

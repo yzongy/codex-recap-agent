@@ -12,7 +12,7 @@ from .config import get_app_paths
 from .git_context import collect_git_summaries
 from .parser import count_shell_snapshots, load_history_tails, load_thread_names, parse_session_file
 from .reporting import render_markdown, write_report
-from .storage import connect, fetch_sessions, insert_events, store_report, upsert_sessions
+from .storage import connect, fetch_events_for_sessions, fetch_sessions, insert_events, store_report, upsert_sessions
 
 
 def _today() -> str:
@@ -132,7 +132,8 @@ def generate_report(app, conn, target_date: str):
     shell_snapshot_counts = count_shell_snapshots(app.shell_snapshots_dir)
     enrich_summaries(selected, history_tails, shell_snapshot_counts)
     daily = filter_sessions_for_day(selected, target_date)
-    report = build_daily_report(target_date, daily, history_sessions=selected)
+    daily_events = fetch_events_for_sessions(conn, [session.session_id for session in daily])
+    report = build_daily_report(target_date, daily, history_sessions=selected, events=daily_events)
     report.metrics["git"] = collect_git_summaries([session.cwd for session in daily])
     report.path = str(app.reports_dir / f"{target_date}.md")
     return report

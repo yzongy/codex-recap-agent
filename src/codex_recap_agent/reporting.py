@@ -26,8 +26,9 @@ def render_markdown(report: DailyReport) -> str:
             [
                 f"- 总分: {report.score.total} / 100（{report.score.label}）",
                 f"- 趋势: {report.score.trend_label}",
-                f"- 正反馈: {report.score.positive_feedback}",
-                f"- 负反馈: {report.score.negative_feedback}",
+                f"- 为什么: {report.score.score_reason}",
+                f"- 加分项: {report.score.positive_feedback}",
+                f"- 扣分项: {report.score.negative_feedback}",
             ]
         )
         if report.score.dimensions:
@@ -47,6 +48,18 @@ def render_markdown(report: DailyReport) -> str:
             lines.append(f"- `{label}` · `{session.cwd or 'unknown'}` · {session.event_count} 条事件")
     else:
         lines.append("- 今天没有找到可分析的会话。")
+    lines.extend(["", "## 今天的具体例子"])
+    if report.examples:
+        for example in report.examples:
+            lines.append(f"- **{example.example_type} · {example.session_label}**")
+            lines.append(f"  - 工作区: `{example.cwd}`")
+            lines.append(f"  - 例子: {example.what_happened}")
+            lines.append(f"  - 影响: {example.why_it_matters}")
+            lines.append(f"  - 下次改法: {example.next_time}")
+    elif not report.sessions:
+        lines.append("- 今天没有可分析会话，不能生成具体例子。")
+    else:
+        lines.append("- 今天没有抓到足够明确的具体例子，先看评分和摘要。")
     lines.extend(["", "## 复盘建议"])
     if report.insights:
         for insight in report.insights:

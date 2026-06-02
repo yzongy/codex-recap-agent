@@ -52,6 +52,16 @@ class DailyInsight:
 
 
 @dataclass
+class DailyExample:
+    example_type: str
+    session_label: str
+    cwd: str
+    what_happened: str
+    why_it_matters: str
+    next_time: str
+
+
+@dataclass
 class ScoreDimension:
     label: str
     score: int
@@ -66,6 +76,7 @@ class DailyScore:
     trend_delta: int
     positive_feedback: str
     negative_feedback: str
+    score_reason: str = ""
     dimensions: List[ScoreDimension] = field(default_factory=list)
 
 
@@ -77,4 +88,5 @@ class DailyReport:
     insights: List[DailyInsight]
     score: Optional[DailyScore]
     metrics: Dict[str, Any]
+    examples: List[DailyExample] = field(default_factory=list)
     path: Optional[str] = None
