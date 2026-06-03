@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Sequence
 
 from .analyzer import recommend_actions
 from .models import DailyReport
@@ -15,11 +13,11 @@ def render_markdown(report: DailyReport) -> str:
         f"- 生成时间: {report.generated_at}",
         f"- 会话数: {report.metrics.get('session_count', 0)}",
         f"- 工具调用: {report.metrics.get('function_calls', 0)}",
-        f"- 疑似失败: {report.metrics.get('tool_errors', 0)}",
+        f"- 工具/环境失败: {report.metrics.get('tool_errors', 0)}",
         f"- 输入 tokens: {report.metrics.get('tokens_input', 0)}",
         f"- 输出 tokens: {report.metrics.get('tokens_output', 0)}",
         "",
-        "## 今日评分",
+        "## 输入质量评分",
     ]
     if report.score:
         lines.extend(
@@ -33,11 +31,17 @@ def render_markdown(report: DailyReport) -> str:
         )
         if report.score.dimensions:
             for dim in report.score.dimensions:
-                lines.append(f"- {dim.label}: {dim.score} / 25 - {dim.detail}")
+                lines.append(f"- {dim.label}: {dim.score} / {dim.max_score} - {dim.detail}")
     else:
         lines.append("- 今天没有评分数据。")
     lines.extend(
         [
+            "",
+            "## Token 统计",
+            f"- 输入 tokens: {report.metrics.get('tokens_input', 0)}",
+            f"- 输出 tokens: {report.metrics.get('tokens_output', 0)}",
+            f"- 合计 tokens: {int(report.metrics.get('tokens_input', 0) or 0) + int(report.metrics.get('tokens_output', 0) or 0)}",
+            "- 说明: token 是消耗统计，不参与输入质量评分。",
             "",
             "## 今日摘要",
         ]
@@ -60,6 +64,25 @@ def render_markdown(report: DailyReport) -> str:
         lines.append("- 今天没有可分析会话，不能生成具体例子。")
     else:
         lines.append("- 今天没有抓到足够明确的具体例子，先看评分和摘要。")
+    lines.extend(["", "## 逐句改写"])
+    if report.prompt_reviews:
+        for review in report.prompt_reviews:
+            lines.append(f"- **{review.review_type} · {review.session_label}**")
+            lines.append(f"  - 工作区: `{review.cwd}`")
+            lines.append(f"  - 原输入: {_inline_text(review.original)}")
+            lines.append(f"  - 问题点: {_inline_text(review.issue)}")
+            lines.append(f"  - 更好的说法: {_inline_text(review.better_prompt)}")
+            lines.append(f"  - 为什么更好: {_inline_text(review.why_better)}")
+    elif not report.sessions:
+        lines.append("- 今天没有可分析会话，不能生成逐句改写。")
+    else:
+        lines.append("- 今天没有抓到需要改写的输入。")
+    lines.extend(["", "## 今天和你讨论"])
+    if report.discussion_questions:
+        for question in report.discussion_questions:
+            lines.append(f"- {question}")
+    else:
+        lines.append("- 今天没有足够材料生成讨论问题。")
     lines.extend(["", "## 复盘建议"])
     if report.insights:
         for insight in report.insights:
@@ -85,6 +108,10 @@ def render_markdown(report: DailyReport) -> str:
         seen.add(cwd)
         lines.append(f"- `{cwd}`")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _inline_text(text: str) -> str:
+    return "；".join(part.strip() for part in text.splitlines() if part.strip())
 
 
 def write_report(report: DailyReport, reports_dir: Path) -> Path:

@@ -66,6 +66,7 @@ class ScoreDimension:
     label: str
     score: int
     detail: str
+    max_score: int = 25
 
 
 @dataclass
@@ -81,6 +82,17 @@ class DailyScore:
 
 
 @dataclass
+class PromptReview:
+    review_type: str
+    session_label: str
+    cwd: str
+    original: str
+    issue: str
+    better_prompt: str
+    why_better: str
+
+
+@dataclass
 class DailyReport:
     report_date: str
     generated_at: str
@@ -89,4 +101,6 @@ class DailyReport:
     score: Optional[DailyScore]
     metrics: Dict[str, Any]
     examples: List[DailyExample] = field(default_factory=list)
+    prompt_reviews: List[PromptReview] = field(default_factory=list)
+    discussion_questions: List[str] = field(default_factory=list)
     path: Optional[str] = None

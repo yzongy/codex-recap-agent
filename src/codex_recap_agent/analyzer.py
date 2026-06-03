@@ -6,7 +6,17 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Sequence
 
-from .models import DailyExample, DailyInsight, DailyReport, DailyScore, EventRecord, ScoreDimension, SessionSummary
+from .input_coach import (
+    build_discussion_questions,
+    build_input_quality_score,
+    build_prompt_reviews,
+    has_strong_drift,
+    is_internal_prompt,
+    is_progressive_thread,
+    looks_scope_sequence,
+    structured_prompt_score,
+)
+from .models import DailyExample, DailyInsight, DailyReport, DailyScore, EventRecord, SessionSummary
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -52,7 +62,7 @@ def build_daily_report(
     if repeated_cwds:
         insights.append(DailyInsight(label="重复聚焦的工作区", detail=f"{len(repeated_cwds)} 个目录今天被反复进入，优先检查是否存在来回切换或目标不清。"))
     if tool_errors:
-        insights.append(DailyInsight(label="工具失败", detail=f"观察到 {tool_errors} 次疑似失败输出，适合把前置条件写得更明确。"))
+        insights.append(DailyInsight(label="工具/环境摩擦", detail=f"观察到 {tool_errors} 次工具或环境失败；这不直接归因于你，但适合让 Codex 尽早诊断。"))
     if function_calls:
         insights.append(DailyInsight(label="工具使用", detail=f"今天共有 {function_calls} 次工具调用，适合检查有没有先搜再问、先列清单再改文件。"))
     if tokens_input + tokens_output:
@@ -66,8 +76,10 @@ def build_daily_report(
     if shell_snapshots:
         insights.append(DailyInsight(label="Shell 快照", detail=f"关联到 {sum(int(v) for v in shell_snapshots)} 个 shell 快照，能看见更多命令层上下文。"))
 
-    score = build_daily_score(report_date, sessions, history_sessions)
     examples = build_daily_examples(sessions, events)
+    prompt_reviews = build_prompt_reviews(sessions, events)
+    score = build_daily_score(report_date, sessions, history_sessions, events)
+    discussion_questions = build_discussion_questions(score, prompt_reviews, examples, sessions)
     metrics = {
         "session_count": len(sessions),
         "function_calls": function_calls,
@@ -79,6 +91,7 @@ def build_daily_report(
         "score": score.total if score else None,
         "score_label": score.label if score else None,
         "score_trend_delta": score.trend_delta if score else None,
+        "prompt_review_count": len(prompt_reviews),
     }
     return DailyReport(
         report_date=report_date,
@@ -88,6 +101,8 @@ def build_daily_report(
         score=score,
         metrics=metrics,
         examples=examples,
+        prompt_reviews=prompt_reviews,
+        discussion_questions=discussion_questions,
     )
 
 
@@ -99,15 +114,16 @@ def recommend_actions(report: DailyReport) -> List[str]:
     actions = [
         example.next_time
         for example in report.examples
-        if example.example_type != "正向样例"
+        if not _is_positive_example(example)
     ]
     if score:
         if score.total >= 80:
             actions.append("保留今天有效做法：先收束目标，再执行和验证。")
         elif score.total < 60:
             actions.append("明天第一个复杂任务先写一句完成标准，再让 Codex 动手。")
-    has_failure_example = any(example.example_type == "失败重试" for example in report.examples)
-    if report.metrics.get("tool_errors", 0) and not has_failure_example:
+    has_failure_example = any(example.example_type == "工具/环境摩擦" for example in report.examples)
+    has_language_example = any(example.example_type in {"目标漂移", "渐进延展", "输入范围过大", "正向输入"} for example in report.examples)
+    if report.metrics.get("tool_errors", 0) and not has_failure_example and not has_language_example:
         actions.append("同类失败出现两次后，先让 Codex 检查 cwd、PATH、权限和最小复现命令。")
     if report.metrics.get("function_calls", 0) > len(sessions) * 6:
         actions.append("把工具调用很多的任务拆成“先定位、再修改、最后验证”三段。")
@@ -132,12 +148,15 @@ def build_daily_examples(
         if event.session_id in sessions_by_id:
             events_by_session[event.session_id].append(event)
 
-    improvement_examples: List[DailyExample] = []
-    improvement_examples.extend(_failure_retry_examples(sessions_by_id, events_by_session))
-    improvement_examples.extend(_goal_drift_examples(sessions_by_id, events_by_session))
-    improvement_examples.extend(_heavy_tool_examples(sessions))
-    positive_examples = _positive_examples(sessions)
-    return improvement_examples[:2] + positive_examples[:1]
+    language_improvements = _goal_drift_examples(sessions_by_id, events_by_session)
+    positive_language_examples = _positive_input_examples(sessions_by_id, events_by_session)
+    if language_improvements or positive_language_examples:
+        return language_improvements[:2] + positive_language_examples[:1]
+
+    external_examples: List[DailyExample] = []
+    external_examples.extend(_failure_retry_examples(sessions_by_id, events_by_session))
+    external_examples.extend(_heavy_tool_examples(sessions))
+    return external_examples[:2] + _positive_examples(sessions)[:1]
 
 
 def _goal_drift_examples(
@@ -149,13 +168,38 @@ def _goal_drift_examples(
         user_messages = [
             _event_text(event)
             for event in session_events
-            if event.event_type == "user_message" and _event_text(event)
+            if event.event_type == "user_message" and _event_text(event) and not is_internal_prompt(_event_text(event))
         ]
         distinct_messages = _distinct_texts(user_messages)
         if len(distinct_messages) < 3:
             continue
         session = sessions_by_id[session_id]
         snippets = "；".join(truncate(message, 34) for message in distinct_messages[:4])
+        if is_progressive_thread(distinct_messages):
+            examples.append(
+                DailyExample(
+                    example_type="渐进延展",
+                    session_label=_session_label(session),
+                    cwd=session.cwd or "unknown",
+                    what_happened=f"同一个主线被连续推进了 {len(distinct_messages)} 轮：{snippets}。",
+                    why_it_matters="这是围绕同一主线逐步深入，不是目标漂移；真正的风险是长会话后当前结论和下一步边界变模糊。",
+                    next_time="每 3-5 轮做一次阶段收束：让 Codex 先总结当前结论、未决问题和下一轮只做什么。",
+                )
+            )
+            continue
+        if not has_strong_drift(distinct_messages):
+            if looks_scope_sequence(distinct_messages):
+                examples.append(
+                    DailyExample(
+                        example_type="输入范围过大",
+                        session_label=_session_label(session),
+                        cwd=session.cwd or "unknown",
+                        what_happened=f"同一会话里连续叠加了多个交付：{snippets}。",
+                        why_it_matters="这不一定是目标漂移，但一次把多个输出形态塞进同一轮，会让 Codex 难以判断先交付哪一个。",
+                        next_time="先指定本轮唯一交付物，再把其他方向列成下一轮候选。",
+                    )
+                )
+            continue
         examples.append(
             DailyExample(
                 example_type="目标漂移",
@@ -192,20 +236,52 @@ def _failure_retry_examples(
             continue
         sample = next(line for found_signature, line in failures if found_signature == signature)
         if count >= 2:
-            happened = f"同类失败出现 {count} 次：{truncate(sample, 100)}。"
+            happened = f"同类工具/环境失败出现 {count} 次：{truncate(sample, 100)}。"
         else:
-            happened = f"这个会话出现 {len(failures)} 次疑似失败，其中一条是：{truncate(sample, 100)}。"
+            happened = f"这个会话出现 {len(failures)} 次工具/环境失败信号，其中一条是：{truncate(sample, 100)}。"
         examples.append(
             DailyExample(
-                example_type="失败重试",
+                example_type="工具/环境摩擦",
                 session_label=_session_label(session),
                 cwd=session.cwd or "unknown",
                 what_happened=happened,
-                why_it_matters="连续重试会消耗工具调用，也容易把真正的路径、安装、权限或 PATH 问题藏在噪音里。",
-                next_time="同类失败两次后先进入诊断模式：检查 cwd、PATH、安装位置、权限，再跑最小验证命令。",
+                why_it_matters="这不算你的操作问题；真正影响效率的是 Codex 继续重试，而不是先定位路径、安装、权限或 PATH。",
+                next_time="看到同类工具/环境失败两次后，直接要求 Codex 进入诊断模式并先跑最小验证命令。",
             )
         )
     return sorted(examples, key=lambda example: example.what_happened, reverse=True)
+
+
+def _positive_input_examples(
+    sessions_by_id: Dict[str, SessionSummary],
+    events_by_session: Dict[str, List[EventRecord]],
+) -> List[DailyExample]:
+    candidates: List[tuple[int, DailyExample]] = []
+    for session_id, session_events in events_by_session.items():
+        session = sessions_by_id[session_id]
+        for event in session_events:
+            if event.event_type != "user_message":
+                continue
+            message = _event_text(event)
+            if is_internal_prompt(message):
+                continue
+            score = structured_prompt_score(message)
+            if score < 3:
+                continue
+            candidates.append(
+                (
+                    score,
+                    DailyExample(
+                        example_type="正向输入",
+                        session_label=_session_label(session),
+                        cwd=session.cwd or "unknown",
+                        what_happened=f"这条输入给出了目标、材料或完成标准：{truncate(message, 100)}。",
+                        why_it_matters="结构化输入会让 Codex 更快对齐交付物、边界和验收方式，少靠后续追问补信息。",
+                        next_time="继续用这个格式开复杂任务：目标、输入材料、输出形式、完成标准、先不要做的事。",
+                    ),
+                )
+            )
+    return [example for _, example in sorted(candidates, key=lambda item: item[0], reverse=True)]
 
 
 def _heavy_tool_examples(sessions: Sequence[SessionSummary]) -> List[DailyExample]:
@@ -255,8 +331,8 @@ def _positive_examples(sessions: Sequence[SessionSummary]) -> List[DailyExample]
             example_type="正向样例",
             session_label=_session_label(session),
             cwd=session.cwd or "unknown",
-            what_happened=f"这个会话用 {session.function_calls} 次工具调用推进，且没有疑似失败。",
-            why_it_matters="低失败、低调用的会话通常说明任务入口和收尾比较清楚，Codex 不需要反复补上下文。",
+            what_happened=f"这个会话用 {session.function_calls} 次工具调用推进，且没有工具/环境失败。",
+            why_it_matters="低故障、低调用的会话通常说明任务入口和收尾比较清楚，Codex 不需要反复补上下文。",
             next_time="保留这个模式：先给目标和验收标准，再让 Codex 执行并报告验证结果。",
         )
     ]
@@ -266,279 +342,9 @@ def build_daily_score(
     report_date: str,
     sessions: Sequence[SessionSummary],
     history_sessions: Sequence[SessionSummary] | None = None,
+    events: Sequence[EventRecord] | None = None,
 ) -> DailyScore:
-    current_profile = _profile_for_day(sessions, report_date)
-    history_profiles = _profiles_by_day(history_sessions or sessions)
-    previous_profiles = [
-        profile
-        for day, profile in sorted(history_profiles.items())
-        if day < report_date
-    ]
-    previous_7 = previous_profiles[-7:]
-    baseline = _average_profiles(previous_7) if previous_7 else None
-    if int(current_profile.get("session_count", 0) or 0) == 0:
-        trend_delta = 0
-        trend_label = "暂无趋势"
-        if previous_7:
-            prior_avg = round(sum(_score_profile(profile, baseline=None).total for profile in previous_7) / len(previous_7))
-            trend_delta = -prior_avg
-            trend_label = f"低于近 7 天平均 {abs(trend_delta)} 分"
-        dimensions = [
-            ScoreDimension(label="目标清晰度", score=0, detail="今天没有可分析的会话。"),
-            ScoreDimension(label="执行效率", score=0, detail="今天没有可分析的工具调用。"),
-            ScoreDimension(label="稳定性", score=0, detail="今天没有可分析的执行记录。"),
-            ScoreDimension(label="收尾质量", score=0, detail="今天没有可分析的收尾信号。"),
-        ]
-        return DailyScore(
-            total=0,
-            label="需要调整",
-            trend_label=trend_label,
-            trend_delta=trend_delta,
-            positive_feedback="今天没有产生新的长会话负担。",
-            negative_feedback="今天没有可分析的 Codex 协作记录，无法证明有推进。",
-            score_reason="今天需要调整，因为没有可分析的 Codex 协作记录，无法判断目标、执行和收尾质量。",
-            dimensions=dimensions,
-        )
-
-    focus = _score_focus(current_profile)
-    efficiency = _score_efficiency(current_profile, baseline)
-    stability = _score_stability(current_profile)
-    completion = _score_completion(current_profile)
-    dimensions = [
-        ScoreDimension(label="目标清晰度", score=focus, detail=_focus_detail(current_profile)),
-        ScoreDimension(label="执行效率", score=efficiency, detail=_efficiency_detail(current_profile, baseline)),
-        ScoreDimension(label="稳定性", score=stability, detail=_stability_detail(current_profile)),
-        ScoreDimension(label="收尾质量", score=completion, detail=_completion_detail(current_profile)),
-    ]
-    total = sum(d.score for d in dimensions)
-    trend_delta = 0
-    trend_label = "暂无趋势"
-    if previous_7:
-        prior_avg = round(sum(_score_profile(profile, baseline=None).total for profile in previous_7) / len(previous_7))
-        trend_delta = total - prior_avg
-        trend_label = _trend_label(trend_delta)
-    label = _overall_label(total)
-    positive, negative = _feedback_for_score(total, dimensions, current_profile)
-    return DailyScore(
-        total=total,
-        label=label,
-        trend_label=trend_label,
-        trend_delta=trend_delta,
-        positive_feedback=positive,
-        negative_feedback=negative,
-        score_reason=_score_reason(total, label, current_profile),
-        dimensions=dimensions,
-    )
-
-
-def _profile_for_day(sessions: Sequence[SessionSummary], report_date: str) -> Dict[str, object]:
-    day_sessions = list(sessions)
-    if not sessions:
-        return {
-            "session_count": 0,
-            "function_calls": 0,
-            "tool_errors": 0,
-            "tokens_input": 0,
-            "tokens_output": 0,
-            "cwd_count": 0,
-            "last_messages": [],
-            "completion_hits": 0,
-            "question_hits": 0,
-        }
-    cwd_counts = Counter((s.cwd or "unknown") for s in day_sessions)
-    last_messages = [s.last_message or "" for s in day_sessions if s.last_message]
-    completion_hits = sum(1 for message in last_messages if _looks_complete(message))
-    question_hits = sum(1 for message in last_messages if _looks_open(message))
-    return {
-        "session_count": len(day_sessions),
-        "function_calls": sum(s.function_calls for s in day_sessions),
-        "tool_errors": sum(s.tool_errors for s in day_sessions),
-        "tokens_input": sum(s.tokens_input for s in day_sessions),
-        "tokens_output": sum(s.tokens_output for s in day_sessions),
-        "cwd_count": len(cwd_counts),
-        "cwd_repeats": sum(1 for count in cwd_counts.values() if count > 1),
-        "last_messages": last_messages,
-        "completion_hits": completion_hits,
-        "question_hits": question_hits,
-    }
-
-
-def _profiles_by_day(sessions: Sequence[SessionSummary]) -> Dict[str, Dict[str, object]]:
-    buckets: Dict[str, List[SessionSummary]] = defaultdict(list)
-    for session in sessions:
-        dt = _parse_dt(session.updated_at or session.started_at)
-        if not dt:
-            continue
-        buckets[dt.date().isoformat()].append(session)
-    return {day: _profile_for_day(items, day) for day, items in buckets.items()}
-
-
-def _average_profiles(profiles: Sequence[Dict[str, object]]) -> Dict[str, float]:
-    keys = ("session_count", "function_calls", "tool_errors", "tokens_input", "tokens_output", "cwd_count", "cwd_repeats", "completion_hits", "question_hits")
-    totals = {key: 0.0 for key in keys}
-    for profile in profiles:
-        for key in keys:
-            totals[key] += float(profile.get(key, 0) or 0)
-    count = max(1, len(profiles))
-    return {key: value / count for key, value in totals.items()}
-
-
-def _score_profile(profile: Dict[str, object], baseline: Dict[str, float] | None) -> DailyScore:
-    focus = _score_focus(profile)
-    efficiency = _score_efficiency(profile, baseline)
-    stability = _score_stability(profile)
-    completion = _score_completion(profile)
-    total = focus + efficiency + stability + completion
-    return DailyScore(
-        total=total,
-        label=_overall_label(total),
-        trend_label="暂无趋势",
-        trend_delta=0,
-        positive_feedback="",
-        negative_feedback="",
-        score_reason="",
-        dimensions=[],
-    )
-
-
-def _score_focus(profile: Dict[str, object]) -> int:
-    score = 25
-    score -= int(max(0, (profile.get("cwd_count", 0) or 0) - 1) * 4)
-    score -= int(max(0, (profile.get("session_count", 0) or 0) - 4) * 1.5)
-    if (profile.get("session_count", 0) or 0) <= 2 and (profile.get("cwd_count", 0) or 0) <= 1:
-        score += 2
-    return _clamp(score)
-
-
-def _score_efficiency(profile: Dict[str, object], baseline: Dict[str, float] | None) -> int:
-    session_count = max(1, int(profile.get("session_count", 0) or 0))
-    calls_per_session = float(profile.get("function_calls", 0) or 0) / session_count
-    tokens_total = float(profile.get("tokens_input", 0) or 0) + float(profile.get("tokens_output", 0) or 0)
-    tokens_per_session = tokens_total / session_count
-    if baseline:
-        baseline_calls = max(1.0, baseline.get("function_calls", 0.0) / max(1.0, baseline.get("session_count", 1.0)))
-        baseline_tokens = max(1.0, (baseline.get("tokens_input", 0.0) + baseline.get("tokens_output", 0.0)) / max(1.0, baseline.get("session_count", 1.0)))
-        call_ratio = calls_per_session / baseline_calls
-        token_ratio = tokens_per_session / baseline_tokens
-        score = 25
-        if call_ratio > 1:
-            score -= min(10, int(round((call_ratio - 1) * 8)))
-        else:
-            score += min(2, int(round((1 - call_ratio) * 4)))
-        if token_ratio > 1:
-            score -= min(10, int(round((token_ratio - 1) * 4)))
-        else:
-            score += min(2, int(round((1 - token_ratio) * 3)))
-        return _clamp(score)
-    score = 25
-    if calls_per_session > 120:
-        score -= 10
-    elif calls_per_session > 80:
-        score -= 5
-    elif calls_per_session > 40:
-        score -= 1
-    if tokens_per_session > 20000000:
-        score -= 7
-    elif tokens_per_session > 10000000:
-        score -= 4
-    elif tokens_per_session > 5000000:
-        score -= 2
-    return _clamp(score)
-
-
-def _score_stability(profile: Dict[str, object]) -> int:
-    calls = int(profile.get("function_calls", 0) or 0)
-    errors = int(profile.get("tool_errors", 0) or 0)
-    if calls <= 0:
-        return 10 if errors else 20
-    error_rate = errors / calls
-    score = 25 - int(round(min(18, error_rate * 120)))
-    if errors == 0 and calls > 0:
-        score += 1
-    return _clamp(score)
-
-
-def _score_completion(profile: Dict[str, object]) -> int:
-    score = 15
-    completion_hits = int(profile.get("completion_hits", 0) or 0)
-    question_hits = int(profile.get("question_hits", 0) or 0)
-    last_messages = len(profile.get("last_messages", []) or [])
-    score += min(8, completion_hits * 2)
-    score += min(2, last_messages // 3)
-    score -= min(6, question_hits * 2)
-    if int(profile.get("tool_errors", 0) or 0) == 0 and last_messages:
-        score += 1
-    return _clamp(score)
-
-
-def _overall_label(score: int) -> str:
-    if score >= 80:
-        return "状态很好"
-    if score >= 60:
-        return "基本可用，有摩擦"
-    return "需要调整"
-
-
-def _trend_label(delta: int) -> str:
-    if delta >= 8:
-        return f"高于近 7 天平均 {delta} 分"
-    if delta <= -8:
-        return f"低于近 7 天平均 {abs(delta)} 分"
-    return f"接近近 7 天平均（{delta:+d} 分）"
-
-
-def _feedback_for_score(score: int, dimensions: List[ScoreDimension], profile: Dict[str, object]) -> tuple[str, str]:
-    best = max(dimensions, key=lambda d: d.score) if dimensions else None
-    worst = min(dimensions, key=lambda d: d.score) if dimensions else None
-    positive_map = {
-        "目标清晰度": "今天的目标收束得比较早，协作没有明显发散。",
-        "执行效率": "工具调用和推进节奏比较干净，没有太多空转。",
-        "稳定性": "今天的执行很稳，失败重试没有明显放大。",
-        "收尾质量": "今天的收尾信号不错，任务结束得比较完整。",
-    }
-    negative_map = {
-        "目标清晰度": "今天工作区切换偏多，任务边界还有点散。",
-        "执行效率": "工具调用偏重，明天可以先拆步再执行。",
-        "稳定性": "失败输出偏多，最好先诊断再继续跑。",
-        "收尾质量": "收尾信号不够强，最好提前定义什么算完成。",
-    }
-    positive = positive_map.get(best.label if best else "", "今天整体还可以。")
-    negative = negative_map.get(worst.label if worst else "", "今天还有一些摩擦，明天可以再收紧一点。")
-    if score >= 80:
-        positive = "今天整体状态不错，节奏和收尾都比较稳。"
-    elif score < 60:
-        negative = "任务入口、失败处理或收尾信号里至少有一项拖慢了推进，明天先把完成标准写清楚。"
-    return positive, negative
-
-
-def _score_reason(score: int, label: str, profile: Dict[str, object]) -> str:
-    session_count = int(profile.get("session_count", 0) or 0)
-    cwd_count = int(profile.get("cwd_count", 0) or 0)
-    calls = int(profile.get("function_calls", 0) or 0)
-    errors = int(profile.get("tool_errors", 0) or 0)
-    completion_hits = int(profile.get("completion_hits", 0) or 0)
-    question_hits = int(profile.get("question_hits", 0) or 0)
-    calls_per_session = calls / max(1, session_count)
-
-    if label == "状态很好":
-        prefix = "今天状态很好"
-    elif label == "基本可用，有摩擦":
-        prefix = "今天基本可用，但还有摩擦"
-    else:
-        prefix = "今天需要调整"
-
-    details = [f"{session_count} 个会话分布在 {cwd_count} 个工作区"]
-    if calls:
-        details.append(f"平均 {calls_per_session:.1f} 次工具调用/会话")
-    if errors:
-        details.append(f"出现 {errors} 次疑似失败")
-    elif calls:
-        details.append("没有疑似失败输出")
-    if question_hits:
-        details.append(f"{question_hits} 条收尾仍像未决问题")
-    elif completion_hits:
-        details.append(f"{completion_hits} 条明显完成信号")
-    return f"{prefix}，主要因为 " + "，".join(details[:4]) + "。"
+    return build_input_quality_score(report_date, sessions, history_sessions, events)
 
 
 def _dedupe(items: Iterable[str]) -> List[str]:
@@ -550,6 +356,10 @@ def _dedupe(items: Iterable[str]) -> List[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+def _is_positive_example(example: DailyExample) -> bool:
+    return example.example_type in {"正向样例", "正向输入"}
 
 
 def _session_label(session: SessionSummary) -> str:
@@ -716,46 +526,10 @@ def _line_exit_code(line: str) -> int | None:
     return None
 
 
-def _focus_detail(profile: Dict[str, object]) -> str:
-    return f"{int(profile.get('session_count', 0) or 0)} 个会话、{int(profile.get('cwd_count', 0) or 0)} 个工作区。"
-
-
-def _efficiency_detail(profile: Dict[str, object], baseline: Dict[str, float] | None) -> str:
-    session_count = max(1, int(profile.get("session_count", 0) or 0))
-    calls_per_session = float(profile.get("function_calls", 0) or 0) / session_count
-    tokens = float(profile.get("tokens_input", 0) or 0) + float(profile.get("tokens_output", 0) or 0)
-    tokens_per_session = tokens / session_count
-    if baseline:
-        baseline_calls = max(1.0, baseline.get("function_calls", 0.0) / max(1.0, baseline.get("session_count", 1.0)))
-        return f"平均 {calls_per_session:.1f} 次工具调用/会话，对比近 7 天基线 {baseline_calls:.1f}。"
-    return f"平均 {calls_per_session:.1f} 次工具调用/会话，约 {tokens_per_session:.0f} tokens/会话。"
-
-
-def _stability_detail(profile: Dict[str, object]) -> str:
-    calls = int(profile.get("function_calls", 0) or 0)
-    errors = int(profile.get("tool_errors", 0) or 0)
-    rate = (errors / calls * 100) if calls else 0
-    return f"{errors} 次疑似失败，约 {rate:.1f}% 的调用出现问题。"
-
-
-def _completion_detail(profile: Dict[str, object]) -> str:
-    return f"{int(profile.get('completion_hits', 0) or 0)} 条明显完成信号，{int(profile.get('question_hits', 0) or 0)} 条未决信号。"
-
-
 def _looks_complete(message: str) -> bool:
     lowered = message.lower()
     keywords = ("完成", "done", "ready", "fixed", "generated", "success", "resolved", "已完成", "收尾", "总结")
     return any(keyword in lowered or keyword in message for keyword in keywords)
-
-
-def _looks_open(message: str) -> bool:
-    lowered = message.lower()
-    keywords = ("待", "需要", "please", "todo", "question", "?", "未决", "继续", "still")
-    return any(keyword in lowered or keyword in message for keyword in keywords)
-
-
-def _clamp(value: int) -> int:
-    return max(0, min(25, int(value)))
 
 
 def truncate(text: str, length: int) -> str:
